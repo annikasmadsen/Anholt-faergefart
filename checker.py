@@ -16,6 +16,7 @@ Konfiguration via environment variables:
   STATE_FILE   – sti til state-fil (default: availability_state.json)
 """
 
+import argparse
 import asyncio
 import json
 import logging
@@ -731,4 +732,13 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Anholt Ferry Availability Checker")
+    parser.add_argument(
+        "--loglevel",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log-niveau (default: INFO)",
+    )
+    args = parser.parse_args()
+    logging.getLogger().setLevel(getattr(logging, args.loglevel))
     sys.exit(asyncio.run(main()))

@@ -17,7 +17,9 @@ on:
 jobs:
   check:
     name: Tjek tilgængelighed
-    runs-on: ubuntu-latest
+    # ubuntu-22.04 (Jammy) bruges fremfor ubuntu-latest (24.04),
+    # fordi libasound2 — en Playwright-systempakke — er fjernet i Ubuntu 24.
+    runs-on: ubuntu-22.04
 
     # Stop job efter 8 minutter (giver 2 min buffer til næste kørsel)
     timeout-minutes: 8
@@ -69,9 +71,11 @@ jobs:
           # Aktivér DEBUG-logging ved manuel kørsel med debug=true
           if [ "${{ inputs.debug }}" = "true" ]; then
             export PYTHONUNBUFFERED=1
-            python -c "import logging; logging.basicConfig(level=logging.DEBUG)"
+            export PYTHONASYNCIODEBUG=1
+            python -u checker.py --loglevel DEBUG
+          else
+            python checker.py
           fi
-          python checker.py
 
       # ── 6. Gem opdateret state-fil (altid, selv ved fejl) ──────────────────
       - name: Gem state-fil

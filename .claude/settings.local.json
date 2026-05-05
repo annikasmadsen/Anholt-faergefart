@@ -8,7 +8,8 @@
       "WebFetch(domain:api.teambooking.dk)",
       "WebFetch(domain:stroheimdesign.com)",
       "WebFetch(domain:teambooking.dk)",
-      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('checker.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('checker.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('checker.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
     ]
   }
 }
