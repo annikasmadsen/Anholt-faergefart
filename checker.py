@@ -162,40 +162,44 @@ def send_ntfy(watch: Watch, available: bool) -> None:
         return
 
     if available:
-        title    = f"Ledige billetter: {watch.from_stop} → {watch.to_stop}!"
+        title    = f"Ledige billetter: {watch.from_stop} -> {watch.to_stop}!"
         message  = (
-            f"Der ser ud til at være ledige billetter på Anholtfærgen:\n"
+            f"Der ser ud til at vaere ledige billetter paa Anholtfaergen:\n"
             f"{watch.passengers} personer, {watch.from_stop} til {watch.to_stop}, "
             f"{watch.date_danish()}.\n"
             f"Tjek og book her: {BOOKING_URL}"
         )
-        priority = "high"
-        tags     = "white_check_mark,ship"
+        priority = 4   # ntfy: 1=min 2=low 3=default 4=high 5=max
+        tags     = ["white_check_mark", "ship"]
     else:
-        title    = f"Anholtfærgen: Pladser væk – {watch.from_stop} → {watch.to_stop}"
+        title    = f"Anholtfaergen: Pladser vaek - {watch.from_stop} -> {watch.to_stop}"
         message  = (
-            f"{watch.passengers} billetter {watch.from_stop}→{watch.to_stop} "
-            f"den {watch.date_danish()} er ikke længere ledige."
+            f"{watch.passengers} billetter {watch.from_stop} -> {watch.to_stop} "
+            f"den {watch.date_danish()} er ikke laengere ledige."
         )
-        priority = "low"
-        tags     = "x"
+        priority = 2
+        tags     = ["x"]
 
-    # Bruger ntfy's JSON API frem for headers, så danske tegn (å, ø, æ)
-    # ikke forårsager UnicodeEncodeError (HTTP-headers skal være ASCII).
+    # Bruger ntfy's JSON API — undgaar ASCII-begrænsninger i HTTP-headers.
     url = f"{NTFY_SERVER.rstrip('/')}"
     payload = {
         "topic":    NTFY_TOPIC,
         "title":    title,
         "message":  message,
         "priority": priority,
-        "tags":     tags.split(","),
+        "tags":     tags,
         "click":    BOOKING_URL,
     }
     try:
         resp = httpx.post(url, json=payload, timeout=15)
-        resp.raise_for_status()
-        log.info(f"[{watch.id}] Notifikation sendt [{priority}]: {title}")
-    except httpx.HTTPError as exc:
+        if not resp.is_success:
+            log.error(
+                f"[{watch.id}] ntfy svarede {resp.status_code}: {resp.text}"
+            )
+        else:
+            log.info(f"[{watch.id}] Notifikation sendt [priority={priority}]: {title}")
+    except Exception as exc:
+        # Notifikationsfejl er ikke fatale — checker-resultatet bevares
         log.error(f"[{watch.id}] Kunne ikke sende ntfy-notifikation: {exc}")
 
 
