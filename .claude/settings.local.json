@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_in_Chrome__tabs_context_mcp",
+      "WebFetch(domain:anholt-ferry.teambooking.dk)",
+      "WebFetch(domain:www.anholtfergen.dk)",
+      "WebSearch",
+      "WebFetch(domain:api.teambooking.dk)",
+      "WebFetch(domain:stroheimdesign.com)",
+      "WebFetch(domain:teambooking.dk)",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('checker.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
+    ]
+  }
+}

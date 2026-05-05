@@ -1,0 +1,17 @@
+# State-fil (gemmes i GitHub Actions cache, ikke i repo)
+availability_state.json
+
+# Screenshots til fejlretning (uploades som GitHub Actions artifacts)
+screenshots/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Playwright
+playwright-report/
+test-results/

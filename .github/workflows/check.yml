@@ -1,0 +1,94 @@
+name: Anholt Ferry – Availability Check
+
+on:
+  # Kør automatisk hvert 10. minut (GitHub Actions kron er UTC)
+  schedule:
+    - cron: "*/10 * * * *"
+
+  # Manuel kørsel fra GitHub-siden (til test)
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "Vis udvidet debug-log"
+        type: boolean
+        default: false
+        required: false
+
+jobs:
+  check:
+    name: Tjek tilgængelighed
+    runs-on: ubuntu-latest
+
+    # Stop job efter 8 minutter (giver 2 min buffer til næste kørsel)
+    timeout-minutes: 8
+
+    steps:
+      # ── 1. Hent koden ──────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Sæt Python op ───────────────────────────────────────────────────
+      - name: Sæt Python 3.11 op
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 3. Installér afhængigheder ─────────────────────────────────────────
+      - name: Installér Python-pakker
+        run: pip install -r requirements.txt
+
+      # Playwright kræver systempakker (chromium headless)
+      - name: Installér Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      # ── 4. Gendan state-fil fra forrige kørsel ─────────────────────────────
+      # Vi bruger GitHub Actions cache til at gemme availability_state.json
+      # mellem kørsler. Ved cache-miss starter vi frisk (ingen notifikation-spam).
+      - name: Gendan state-fil
+        id: cache-state
+        uses: actions/cache/restore@v4
+        with:
+          path: availability_state.json
+          # Unik nøgle per kørsel, fallback til nyeste eksisterende
+          key: anholt-state-${{ github.run_id }}
+          restore-keys: |
+            anholt-state-
+
+      # ── 5. Kør tilgængelighedstjekket ──────────────────────────────────────
+      - name: Kør checker
+        env:
+          TARGET_DATE: "2026-05-17"
+          FROM_STOP: "Anholt"
+          TO_STOP: "Grenå"
+          PASSENGERS: "6"
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          # NTFY_SERVER kan overskrives som repository-variabel; default: ntfy.sh
+          NTFY_SERVER: ${{ vars.NTFY_SERVER || 'https://ntfy.sh' }}
+        run: |
+          # Aktivér DEBUG-logging ved manuel kørsel med debug=true
+          if [ "${{ inputs.debug }}" = "true" ]; then
+            export PYTHONUNBUFFERED=1
+            python -c "import logging; logging.basicConfig(level=logging.DEBUG)"
+          fi
+          python checker.py
+
+      # ── 6. Gem opdateret state-fil (altid, selv ved fejl) ──────────────────
+      - name: Gem state-fil
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: availability_state.json
+          key: anholt-state-${{ github.run_id }}
+
+      # ── 7. Upload screenshots som artifact (til fejlretning) ───────────────
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_id }}
+          path: screenshots/
+          # Fejl ikke hvis der ingen screenshots er (f.eks. ved API-succes)
+          if-no-files-found: ignore
+          # Behold screenshots i 7 dage
+          retention-days: 7
