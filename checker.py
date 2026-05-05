@@ -180,19 +180,19 @@ def send_ntfy(watch: Watch, available: bool) -> None:
         priority = "low"
         tags     = "x"
 
-    url = f"{NTFY_SERVER.rstrip('/')}/{NTFY_TOPIC}"
+    # Bruger ntfy's JSON API frem for headers, så danske tegn (å, ø, æ)
+    # ikke forårsager UnicodeEncodeError (HTTP-headers skal være ASCII).
+    url = f"{NTFY_SERVER.rstrip('/')}"
+    payload = {
+        "topic":    NTFY_TOPIC,
+        "title":    title,
+        "message":  message,
+        "priority": priority,
+        "tags":     tags.split(","),
+        "click":    BOOKING_URL,
+    }
     try:
-        resp = httpx.post(
-            url,
-            content=message.encode("utf-8"),
-            headers={
-                "Title":        title,
-                "Priority":     priority,
-                "Tags":         tags,
-                "Content-Type": "text/plain; charset=utf-8",
-            },
-            timeout=15,
-        )
+        resp = httpx.post(url, json=payload, timeout=15)
         resp.raise_for_status()
         log.info(f"[{watch.id}] Notifikation sendt [{priority}]: {title}")
     except httpx.HTTPError as exc:
