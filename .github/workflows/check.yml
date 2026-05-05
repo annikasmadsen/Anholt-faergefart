@@ -63,12 +63,9 @@ jobs:
             anholt-state-
 
       # ── 5. Kør tilgængelighedstjekket ──────────────────────────────────────
+      # Ruter og datoer konfigureres i watches.json — ikke her.
       - name: Kør checker
         env:
-          TARGET_DATE: "2026-05-17"
-          FROM_STOP: "Anholt"
-          TO_STOP: "Grenå"
-          PASSENGERS: "6"
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           # NTFY_SERVER kan overskrives som repository-variabel; default: ntfy.sh
           NTFY_SERVER: ${{ vars.NTFY_SERVER || 'https://ntfy.sh' }}

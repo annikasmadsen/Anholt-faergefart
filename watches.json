@@ -1,0 +1,18 @@
+[
+  {
+    "id": "anholt-grenaa-17maj",
+    "from": "Anholt",
+    "to": "Grenå",
+    "date": "2026-05-17",
+    "passengers": 6,
+    "enabled": true
+  },
+  {
+    "id": "grenaa-anholt-20maj",
+    "from": "Grenå",
+    "to": "Anholt",
+    "date": "2026-05-20",
+    "passengers": 4,
+    "enabled": false
+  }
+]
