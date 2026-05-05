@@ -14,6 +14,11 @@ on:
         default: false
         required: false
 
+# Tvinger GitHub Actions-scripts til at køre på Node.js 24 fremfor 20.
+# Påkrævet inden 2. juni 2026, hvor Node.js 20 fjernes fra runnerne.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   check:
     name: Tjek tilgængelighed
@@ -68,11 +73,8 @@ jobs:
           # NTFY_SERVER kan overskrives som repository-variabel; default: ntfy.sh
           NTFY_SERVER: ${{ vars.NTFY_SERVER || 'https://ntfy.sh' }}
         run: |
-          # Aktivér DEBUG-logging ved manuel kørsel med debug=true
           if [ "${{ inputs.debug }}" = "true" ]; then
-            export PYTHONUNBUFFERED=1
-            export PYTHONASYNCIODEBUG=1
-            python -u checker.py --loglevel DEBUG
+            python checker.py --loglevel DEBUG
           else
             python checker.py
           fi
