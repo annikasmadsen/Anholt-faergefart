@@ -155,11 +155,11 @@ def watch_state(state: dict, watch_id: str) -> dict:
 
 # ─── Notifikationer ───────────────────────────────────────────────────────────
 
-def send_ntfy(watch: Watch, available: bool) -> None:
+def send_ntfy(watch: Watch, available: bool) -> bool:
     """Sender en push-notifikation via ntfy.sh for én overvågning."""
     if not NTFY_TOPIC:
         log.warning("NTFY_TOPIC er ikke sat — notifikation springes over")
-        return
+        return False
 
     if available:
         title    = f"Ledige billetter: {watch.from_stop} -> {watch.to_stop}!"
@@ -196,11 +196,13 @@ def send_ntfy(watch: Watch, available: bool) -> None:
             log.error(
                 f"[{watch.id}] ntfy svarede {resp.status_code}: {resp.text}"
             )
-        else:
-            log.info(f"[{watch.id}] Notifikation sendt [priority={priority}]: {title}")
+            return False
+        log.info(f"[{watch.id}] Notifikation sendt [priority={priority}]: {title}")
+        return True
     except Exception as exc:
         # Notifikationsfejl er ikke fatale — checker-resultatet bevares
         log.error(f"[{watch.id}] Kunne ikke sende ntfy-notifikation: {exc}")
+        return False
 
 
 # ─── Screenshots ──────────────────────────────────────────────────────────────
@@ -785,9 +787,9 @@ async def process_watch(watch: Watch, state: dict) -> None:
 
     if available and not was_notified:
         log.info(f"[{watch.id}] Ny tilgængelighed — sender notifikation!")
-        send_ntfy(watch, available=True)
+        sent = send_ntfy(watch, available=True)
         ws["available"] = True
-        ws["notified"]  = True
+        ws["notified"]  = sent  # Kun True hvis ntfy faktisk bekræftede levering
 
     elif not available and prev_available:
         log.info(f"[{watch.id}] Tilgængelighed tabt — nulstiller notifikations-flag")
