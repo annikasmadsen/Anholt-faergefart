@@ -108,14 +108,22 @@ def load_watches() -> list[Watch]:
 
 def load_state() -> dict:
     """Indlæser gemt tilstand. State er struktureret pr. watch-id."""
+    default = {"watches": {}, "discovered_api": None}
     if STATE_FILE.exists():
         try:
             state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            # Gammelt enkelt-watch-format mangler 'watches'-nøglen — nulstil.
+            if "watches" not in state:
+                log.warning(
+                    "State-fil er i gammelt format (enkelt-watch) — "
+                    "nulstiller til nyt multi-watch format"
+                )
+                return default
             log.info(f"Gemt tilstand indlæst fra {STATE_FILE}")
             return state
         except Exception as exc:
             log.warning(f"Kunne ikke læse state-fil, starter frisk: {exc}")
-    return {"watches": {}, "discovered_api": None}
+    return default
 
 
 def save_state(state: dict) -> None:
