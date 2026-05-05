@@ -13,6 +13,6 @@
     "to": "Anholt",
     "date": "2026-05-15",
     "passengers": 6,
-    "enabled": false
+    "enabled": true
   }
 ]
