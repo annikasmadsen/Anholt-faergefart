@@ -18,6 +18,7 @@ on:
 # Påkrævet inden 2. juni 2026, hvor Node.js 20 fjernes fra runnerne.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONIOENCODING: "utf-8"
 
 jobs:
   check:

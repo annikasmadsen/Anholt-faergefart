@@ -21,6 +21,12 @@ import logging
 import os
 import re
 import sys
+
+# Sikrer UTF-8 output i GitHub Actions (Linux pipe bruger ellers ASCII)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from dataclasses import dataclass
 from datetime import datetime, date as date_type
 from pathlib import Path
