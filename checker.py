@@ -2,18 +2,16 @@
 """
 Anholt Ferry Availability Checker
 ==================================
-Tjekker om der er ledige billetter til 6 personer på ruten
-Anholt → Grenå den 17. maj 2026. Sender besked via ntfy.sh,
-hvis der dukker ledige pladser op.
+Læser overvågningslisten fra watches.json og tjekker tilgængelighed
+for alle aktive afgange. Sender push-notifikation via ntfy.sh,
+når ledige pladser opdages for en overvågning.
 
 Konfiguration via environment variables:
-  NTFY_TOPIC   – ntfy-topic (kræves for notifikationer)
-  TARGET_DATE  – dato at tjekke, ISO-format (default: 2026-05-17)
-  FROM_STOP    – afgangssted (default: Anholt)
-  TO_STOP      – ankomststed (default: Grenå)
-  PASSENGERS   – antal passagerer (default: 6)
-  NTFY_SERVER  – ntfy-serveradresse (default: https://ntfy.sh)
-  STATE_FILE   – sti til state-fil (default: availability_state.json)
+  NTFY_TOPIC     – ntfy-topic (kræves for notifikationer)
+  NTFY_SERVER    – ntfy-serveradresse (default: https://ntfy.sh)
+  WATCHES_FILE   – sti til watches.json (default: watches.json)
+  STATE_FILE     – sti til state-fil (default: availability_state.json)
+  PAUSE_SECONDS  – pause i sekunder mellem overvågninger (default: 5)
 """
 
 import argparse
@@ -23,6 +21,7 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, date as date_type
 from pathlib import Path
 from typing import Optional
@@ -36,19 +35,18 @@ from playwright.async_api import (
 )
 
 # ─── Konfiguration ────────────────────────────────────────────────────────────
-TARGET_DATE     = os.getenv("TARGET_DATE", "2026-05-17")
-FROM_STOP       = os.getenv("FROM_STOP", "Anholt")
-TO_STOP         = os.getenv("TO_STOP", "Grenå")
-PASSENGERS      = int(os.getenv("PASSENGERS", "6"))
 NTFY_TOPIC      = os.getenv("NTFY_TOPIC", "")
 NTFY_SERVER     = os.getenv("NTFY_SERVER", "https://ntfy.sh")
+WATCHES_FILE    = Path(os.getenv("WATCHES_FILE", "watches.json"))
 STATE_FILE      = Path(os.getenv("STATE_FILE", "availability_state.json"))
+PAUSE_SECONDS   = int(os.getenv("PAUSE_SECONDS", "5"))
 SCREENSHOTS_DIR = Path("screenshots")
 
 BOOKING_URL = "https://anholt-ferry.teambooking.dk/timetable?lang=da"
 
-# Maksimal timeout for hele tjekket (5 minutter)
-OVERALL_TIMEOUT_SECONDS = 300
+# Maksimal samlet timeout per overvågning (5 minutter)
+WATCH_TIMEOUT_SECONDS = 300
+
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -59,60 +57,111 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+# ─── Watch-dataklasse ─────────────────────────────────────────────────────────
+
+@dataclass
+class Watch:
+    id: str
+    from_stop: str
+    to_stop: str
+    date: str
+    passengers: int
+    enabled: bool
+
+    def label(self) -> str:
+        """Kort beskrivelse til log og notifikation."""
+        return f"{self.from_stop}→{self.to_stop} {self.date} ({self.passengers} pers.)"
+
+    def date_danish(self) -> str:
+        """Dato formateret på dansk: '17. maj 2026'."""
+        months = [
+            "", "januar", "februar", "marts", "april", "maj", "juni",
+            "juli", "august", "september", "oktober", "november", "december",
+        ]
+        d = date_type.fromisoformat(self.date)
+        return f"{d.day}. {months[d.month]} {d.year}"
+
+
+def load_watches() -> list[Watch]:
+    """Indlæser watches.json og returnerer aktive overvågninger."""
+    if not WATCHES_FILE.exists():
+        log.error(f"Kan ikke finde {WATCHES_FILE} — opret filen med dine overvågninger")
+        sys.exit(1)
+    raw = json.loads(WATCHES_FILE.read_text(encoding="utf-8"))
+    watches = [
+        Watch(
+            id=w["id"],
+            from_stop=w["from"],
+            to_stop=w["to"],
+            date=w["date"],
+            passengers=w["passengers"],
+            enabled=w.get("enabled", True),
+        )
+        for w in raw
+    ]
+    active = [w for w in watches if w.enabled]
+    log.info(f"Indlæst {len(watches)} overvågning(er), {len(active)} aktiv(e)")
+    return active
+
+
 # ─── State-håndtering ─────────────────────────────────────────────────────────
 
 def load_state() -> dict:
-    """Indlæser den gemte tilstand fra JSON-filen."""
+    """Indlæser gemt tilstand. State er struktureret pr. watch-id."""
     if STATE_FILE.exists():
         try:
             state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            log.info(
-                f"Gemt tilstand: available={state.get('available')}, "
-                f"notified={state.get('notified')}"
-            )
+            log.info(f"Gemt tilstand indlæst fra {STATE_FILE}")
             return state
         except Exception as exc:
             log.warning(f"Kunne ikke læse state-fil, starter frisk: {exc}")
-    return {
-        "available": False,
-        "notified": False,
-        "last_check": None,
-        "last_error": None,
-        "discovered_api": None,  # Gemmes, hvis vi finder en direkte API
-    }
+    return {"watches": {}, "discovered_api": None}
 
 
 def save_state(state: dict) -> None:
-    """Gemmer den aktuelle tilstand til JSON-filen."""
-    state["last_check"] = datetime.utcnow().isoformat() + "Z"
+    """Gemmer tilstand til JSON-filen."""
+    state["last_updated"] = datetime.utcnow().isoformat() + "Z"
     STATE_FILE.write_text(
         json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     log.info(f"Tilstand gemt → {STATE_FILE}")
 
 
+def watch_state(state: dict, watch_id: str) -> dict:
+    """Henter eller opretter state-entry for en specifik overvågning."""
+    if watch_id not in state["watches"]:
+        state["watches"][watch_id] = {
+            "available": False,
+            "notified": False,
+            "last_check": None,
+            "last_error": None,
+        }
+    return state["watches"][watch_id]
+
+
 # ─── Notifikationer ───────────────────────────────────────────────────────────
 
-def send_ntfy(available: bool) -> None:
-    """Sender en push-notifikation via ntfy.sh."""
+def send_ntfy(watch: Watch, available: bool) -> None:
+    """Sender en push-notifikation via ntfy.sh for én overvågning."""
     if not NTFY_TOPIC:
         log.warning("NTFY_TOPIC er ikke sat — notifikation springes over")
         return
 
     if available:
-        title    = "Ledige billetter på Anholtfærgen!"
+        title    = f"Ledige billetter: {watch.from_stop} → {watch.to_stop}!"
         message  = (
-            f"Der ser ud til at være ledige billetter på Anholtfærgen: "
-            f"{PASSENGERS} personer, {FROM_STOP} til {TO_STOP}, "
-            f"17. maj 2026. Tjek og book her: {BOOKING_URL}"
+            f"Der ser ud til at være ledige billetter på Anholtfærgen:\n"
+            f"{watch.passengers} personer, {watch.from_stop} til {watch.to_stop}, "
+            f"{watch.date_danish()}.\n"
+            f"Tjek og book her: {BOOKING_URL}"
         )
         priority = "high"
         tags     = "white_check_mark,ship"
     else:
-        title    = "Anholtfærgen: Pladser ikke længere ledige"
+        title    = f"Anholtfærgen: Pladser væk – {watch.from_stop} → {watch.to_stop}"
         message  = (
-            f"{PASSENGERS} billetter {FROM_STOP}→{TO_STOP} den 17. maj 2026 "
-            f"er ikke længere ledige ifølge den seneste kontrol."
+            f"{watch.passengers} billetter {watch.from_stop}→{watch.to_stop} "
+            f"den {watch.date_danish()} er ikke længere ledige."
         )
         priority = "low"
         tags     = "x"
@@ -131,56 +180,50 @@ def send_ntfy(available: bool) -> None:
             timeout=15,
         )
         resp.raise_for_status()
-        log.info(f"Notifikation sendt til '{NTFY_TOPIC}': [{priority}] {title}")
+        log.info(f"[{watch.id}] Notifikation sendt [{priority}]: {title}")
     except httpx.HTTPError as exc:
-        log.error(f"Kunne ikke sende ntfy-notifikation: {exc}")
+        log.error(f"[{watch.id}] Kunne ikke sende ntfy-notifikation: {exc}")
 
 
 # ─── Screenshots ──────────────────────────────────────────────────────────────
 
-async def screenshot(page: Page, label: str) -> Path:
-    """Gemmer et screenshot med tidsstempel og label."""
+async def screenshot(page: Page, watch_id: str, label: str) -> Path:
+    """Gemmer et screenshot med watch-id, tidsstempel og label."""
     SCREENSHOTS_DIR.mkdir(exist_ok=True)
     ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    path = SCREENSHOTS_DIR / f"{ts}_{label}.png"
+    path = SCREENSHOTS_DIR / f"{ts}_{watch_id}_{label}.png"
     try:
         await page.screenshot(path=str(path), full_page=True)
-        log.info(f"Screenshot gemt: {path}")
+        log.info(f"[{watch_id}] Screenshot: {path}")
     except Exception as exc:
-        log.warning(f"Kunne ikke gemme screenshot '{label}': {exc}")
+        log.warning(f"[{watch_id}] Kunne ikke gemme screenshot: {exc}")
     return path
 
 
-# ─── Direkte API-tjek (hurtigste metode, bruges hvis vi kender endpointet) ────
+# ─── Direkte API-tjek ─────────────────────────────────────────────────────────
 
-def try_api_check(api_url: str) -> Optional[bool]:
+def try_api_check(api_url: str, watch: Watch) -> Optional[bool]:
     """
-    Forsøger at kalde teambooking-API'en direkte, hvis vi kender URL'en
-    fra en tidligere Playwright-session.
-
+    Forsøger at kalde teambooking-API'en direkte med en cachet URL.
     Returnerer True/False/None.
     """
     try:
-        log.info(f"Forsøger direkte API-kald: {api_url}")
+        log.info(f"[{watch.id}] Direkte API-kald: {api_url}")
         resp = httpx.get(api_url, timeout=20, follow_redirects=True)
         resp.raise_for_status()
         data = resp.json()
-        log.debug(f"API-svar: {str(data)[:500]}")
-        return parse_api_for_availability(api_url, data)
+        return parse_api_for_availability(api_url, data, watch)
     except Exception as exc:
-        log.warning(f"Direkte API-kald mislykkedes: {exc}")
+        log.warning(f"[{watch.id}] Direkte API-kald mislykkedes: {exc}")
         return None
 
 
-# ─── Playwright-baseret tjek ──────────────────────────────────────────────────
+# ─── Playwright-session ───────────────────────────────────────────────────────
 
-async def check_with_playwright() -> tuple[Optional[bool], Optional[str]]:
+async def check_watch_with_playwright(watch: Watch) -> tuple[Optional[bool], Optional[str]]:
     """
-    Bruger Playwright til at navigere bookingsiden og tjekke tilgængelighed.
-
+    Bruger Playwright til at navigere bookingsiden for én overvågning.
     Returnerer (available: bool|None, discovered_api_url: str|None).
-    - available: True = ledigt, False = udsolgt, None = ukendt
-    - discovered_api_url: URL til teambooking-API'en, hvis den blev fanget
     """
     captured_responses: list[dict] = []
 
@@ -195,7 +238,6 @@ async def check_with_playwright() -> tuple[Optional[bool], Optional[str]]:
             ],
         )
         context = await browser.new_context(
-            # Pålidelig browser-user-agent, der ligner en rigtig bruger
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -206,98 +248,63 @@ async def check_with_playwright() -> tuple[Optional[bool], Optional[str]]:
         )
         page = await context.new_page()
 
-        # ── Fang alle JSON-svar fra teambooking ──────────────────────────────
+        # Fang JSON-svar fra teambooking
         async def on_response(response: Response) -> None:
-            url = response.url
-            if "teambooking.dk" not in url:
+            if "teambooking.dk" not in response.url:
                 return
             if response.status != 200:
                 return
-            ct = response.headers.get("content-type", "")
-            if "json" not in ct:
+            if "json" not in response.headers.get("content-type", ""):
                 return
             try:
                 body = await response.json()
-                captured_responses.append({"url": url, "data": body})
-                log.info(f"API-svar fanget: {url}")
+                captured_responses.append({"url": response.url, "data": body})
+                log.info(f"[{watch.id}] API-svar fanget: {response.url}")
             except Exception:
                 pass
 
         page.on("response", on_response)
 
         try:
-            # ── Trin 1: Indlæs timetable-siden ───────────────────────────────
-            log.info(f"Indlæser: {BOOKING_URL}")
+            log.info(f"[{watch.id}] Indlæser: {BOOKING_URL}")
             await page.goto(BOOKING_URL, wait_until="networkidle", timeout=60_000)
             await page.wait_for_timeout(3_000)
+            await screenshot(page, watch.id, "01_indlæst")
 
-            log.info(f"Sidetitel: {await page.title()} | URL: {page.url}")
-            await screenshot(page, "01_indlæst")
+            log.info(f"[{watch.id}] Navigerer til dato: {watch.date}")
+            await navigate_to_date(page, watch)
+            await page.wait_for_timeout(2_500)
+            await screenshot(page, watch.id, "02_dato_valgt")
 
-            # Log fangede API-kald
-            _log_captured(captured_responses, "ved sideindlæsning")
+            log.info(f"[{watch.id}] Vælger rute: {watch.from_stop} → {watch.to_stop}")
+            await select_route_direction(page, watch)
+            await page.wait_for_timeout(2_000)
+            await screenshot(page, watch.id, "03_rute_valgt")
+
             discovered_api = _find_best_api_url(captured_responses)
 
-            # ── Trin 2: Naviger til måldatoen ────────────────────────────────
-            log.info(f"Navigerer til dato: {TARGET_DATE}")
-            await navigate_to_date(page, TARGET_DATE)
-            await page.wait_for_timeout(2_500)
-            await screenshot(page, "02_dato_valgt")
-
-            _log_captured(captured_responses, "efter datonavigation")
-            if not discovered_api:
-                discovered_api = _find_best_api_url(captured_responses)
-
-            # ── Trin 3: Vælg rute-retning, hvis muligt ───────────────────────
-            log.info(f"Vælger rute: {FROM_STOP} → {TO_STOP}")
-            await select_route_direction(page)
-            await page.wait_for_timeout(2_000)
-            await screenshot(page, "03_rute_valgt")
-
-            _log_captured(captured_responses, "efter rutevalg")
-            if not discovered_api:
-                discovered_api = _find_best_api_url(captured_responses)
-
-            # ── Trin 4: Analyser tilgængelighed ──────────────────────────────
-            log.info("Analyserer tilgængelighed på siden...")
-            available = await detect_availability(page, captured_responses)
+            log.info(f"[{watch.id}] Analyserer tilgængelighed...")
+            available = await detect_availability(page, captured_responses, watch)
             return available, discovered_api
 
         except PlaywrightTimeout as exc:
-            log.error(f"Timeout under tjek: {exc}")
-            await screenshot(page, "fejl_timeout")
+            log.error(f"[{watch.id}] Timeout: {exc}")
+            await screenshot(page, watch.id, "fejl_timeout")
             return None, None
-
         except Exception as exc:
-            log.error(f"Uventet fejl: {exc}", exc_info=True)
-            await screenshot(page, "fejl_uventet")
+            log.error(f"[{watch.id}] Uventet fejl: {exc}", exc_info=True)
+            await screenshot(page, watch.id, "fejl_uventet")
             return None, None
-
         finally:
             await browser.close()
 
 
-def _log_captured(responses: list, context: str) -> None:
-    """Logger fangede API-svar til fejlretning."""
-    if not responses:
-        return
-    log.info(f"Fangede {len(responses)} API-svar {context}:")
-    for item in responses:
-        log.info(f"  → {item['url']}")
-        log.debug(f"     Data: {str(item['data'])[:300]}")
-
-
 def _find_best_api_url(responses: list) -> Optional[str]:
-    """
-    Finder den bedste API-URL til fremtidigt direkte brug.
-    Prioriterer URLs der ligner timetable/departures-endpoints.
-    """
+    """Finder bedste API-URL til direkte genbrug i fremtidige kørsler."""
     keywords = ["timetable", "departure", "afgang", "sejlplan", "availability"]
     for item in responses:
-        url = item["url"].lower()
-        if any(k in url for k in keywords):
+        if any(k in item["url"].lower() for k in keywords):
             return item["url"]
-    # Returnér den første teambooking-URL som fallback
     for item in responses:
         if "api.teambooking.dk" in item["url"]:
             return item["url"]
@@ -306,13 +313,14 @@ def _find_best_api_url(responses: list) -> Optional[str]:
 
 # ─── Datonavigation ───────────────────────────────────────────────────────────
 
-async def navigate_to_date(page: Page, target_date: str) -> None:
+async def navigate_to_date(page: Page, watch: Watch) -> None:
     """
-    Forsøger at navigere timetable-siden til den ønskede dato.
-    Prøver i rækkefølge: URL-parameter → date-input → kalender-knapper.
+    Navigerer timetable-siden til den ønskede dato.
+    Prøver: URL-parameter → date-input → kalender-knapnavigation.
     """
-    # Strategi 1: URL-parametre (hurtigst og mest pålidelig)
-    date_nodash = target_date.replace("-", "")
+    target_date  = watch.date
+    date_nodash  = target_date.replace("-", "")
+
     for url_candidate in [
         f"{BOOKING_URL}&date={target_date}",
         f"{BOOKING_URL}&date={date_nodash}",
@@ -323,18 +331,22 @@ async def navigate_to_date(page: Page, target_date: str) -> None:
             await page.goto(url_candidate, wait_until="networkidle", timeout=30_000)
             await page.wait_for_timeout(1_500)
             page_text = await page.evaluate("() => document.body.innerText")
-            # Tjek om datoen nu vises (17 + maj/may)
-            if "17" in page_text and (
-                "maj" in page_text.lower() or "may" in page_text.lower()
+            d = date_type.fromisoformat(target_date)
+            months_da = [
+                "", "januar", "februar", "marts", "april", "maj", "juni",
+                "juli", "august", "september", "oktober", "november", "december",
+            ]
+            if str(d.day) in page_text and (
+                months_da[d.month] in page_text.lower()
+                or f"{d.month:02d}" in page_text
             ):
-                log.info(f"URL-dato-navigation lykkedes: {url_candidate}")
+                log.info(f"[{watch.id}] URL-dato-navigation lykkedes: {url_candidate}")
                 return
         except Exception as exc:
-            log.debug(f"URL-strategi mislykkedes ({url_candidate}): {exc}")
+            log.debug(f"[{watch.id}] URL-strategi mislykkedes: {exc}")
 
-    log.info("URL-navigation bekræftede ikke datoen, prøver UI-navigation...")
+    log.info(f"[{watch.id}] Prøver UI-datonavigation...")
 
-    # Strategi 2: date-input felt
     for selector in [
         'input[type="date"]',
         'input[placeholder*="dato" i]',
@@ -348,30 +360,23 @@ async def navigate_to_date(page: Page, target_date: str) -> None:
                 await inp.fill(target_date)
                 await inp.press("Tab")
                 await page.wait_for_timeout(1_500)
-                log.info(f"Dato sat via '{selector}'")
+                log.info(f"[{watch.id}] Dato sat via '{selector}'")
                 return
         except Exception:
             pass
 
-    # Strategi 3: Klik på "næste dag/uge" knapper for at nå datoen
-    log.info("Forsøger kalender-knapnavigation...")
-    await navigate_calendar_buttons(page, target_date)
+    await navigate_calendar_buttons(page, watch)
 
 
-async def navigate_calendar_buttons(page: Page, target_date: str) -> None:
-    """
-    Klikker på 'næste'-knapper for at nå frem til målдатoen.
-    Maks 60 klik som sikkerhedsspærre.
-    """
-    target  = date_type.fromisoformat(target_date)
-    today   = date_type.today()
+async def navigate_calendar_buttons(page: Page, watch: Watch) -> None:
+    """Klikker på 'næste'-knapper for at nå frem til målдатoen (maks 60 klik)."""
+    target     = date_type.fromisoformat(watch.date)
+    today      = date_type.today()
     days_ahead = (target - today).days
 
     if days_ahead <= 0:
-        log.info("Måldatoen er i dag eller fortiden — springer datonavigation over")
         return
 
-    # Mulige selectors for "næste dag" eller "næste uge" knapper
     next_selectors = [
         'button[aria-label*="næste" i]',
         'button[aria-label*="next" i]',
@@ -382,7 +387,6 @@ async def navigate_calendar_buttons(page: Page, target_date: str) -> None:
         '[class*="forward"]',
         'button:has-text("›")',
         'button:has-text(">")',
-        'button:has-text("→")',
     ]
 
     clicks = 0
@@ -400,237 +404,181 @@ async def navigate_calendar_buttons(page: Page, target_date: str) -> None:
             except Exception:
                 pass
         if not clicked:
-            log.warning("Kunne ikke finde 'næste'-knap til kalendernavigation")
+            log.warning(f"[{watch.id}] Kunne ikke finde 'næste'-knap")
             break
 
-    log.info(f"Kalendernavigation: klikket {clicks} gange fremad")
+    log.info(f"[{watch.id}] Kalendernavigation: {clicks} klik fremad")
 
 
 # ─── Rutevalg ─────────────────────────────────────────────────────────────────
 
-async def select_route_direction(page: Page) -> None:
-    """
-    Forsøger at vælge rute-retningen Anholt → Grenå,
-    hvis der findes en retnings-vælger på siden.
-    """
-    # Tekstbaserede selectors (mest robuste)
+async def select_route_direction(page: Page, watch: Watch) -> None:
+    """Forsøger at vælge rute-retning, hvis siden har en retningsvælger."""
+    from_stop = watch.from_stop
+    to_stop   = watch.to_stop
+
     for selector in [
-        f"text={FROM_STOP} til {TO_STOP}",
-        f"text={FROM_STOP} - {TO_STOP}",
-        f"text={FROM_STOP} → {TO_STOP}",
-        f"text={FROM_STOP} > {TO_STOP}",
-        f'label:has-text("{FROM_STOP}")',
-        f'button:has-text("{FROM_STOP}")',
+        f"text={from_stop} til {to_stop}",
+        f"text={from_stop} - {to_stop}",
+        f"text={from_stop} → {to_stop}",
+        f'label:has-text("{from_stop}")',
+        f'button:has-text("{from_stop}")',
     ]:
         try:
             el = page.locator(selector).first
             if await el.is_visible(timeout=2_000):
                 await el.click()
                 await page.wait_for_timeout(1_000)
-                log.info(f"Rute valgt via: '{selector}'")
+                log.info(f"[{watch.id}] Rute valgt via: '{selector}'")
                 return
         except Exception:
             pass
 
-    # Dropdown-selector med Anholt som option
     try:
         for sel_el in await page.locator("select").all():
             for opt in await sel_el.locator("option").all():
                 text = (await opt.text_content() or "").strip()
-                if FROM_STOP in text and (TO_STOP in text or "Gren" in text):
+                if from_stop in text and (to_stop in text or "Gren" in text):
                     val = await opt.get_attribute("value") or ""
                     await sel_el.select_option(value=val)
                     await page.wait_for_timeout(1_000)
-                    log.info(f"Rute valgt fra dropdown: '{text}'")
+                    log.info(f"[{watch.id}] Rute valgt fra dropdown: '{text}'")
                     return
     except Exception as exc:
-        log.debug(f"Dropdown-rutevalg mislykkedes: {exc}")
+        log.debug(f"[{watch.id}] Dropdown-rutevalg mislykkedes: {exc}")
 
-    log.info("Ingen rutevalg-element fundet — antager standardvisning er korrekt")
+    log.info(f"[{watch.id}] Ingen rutevalg-element fundet — antager standardvisning")
 
 
 # ─── Tilgængelighedsanalyse ───────────────────────────────────────────────────
 
 async def detect_availability(
-    page: Page, captured: list
+    page: Page, captured: list, watch: Watch
 ) -> Optional[bool]:
     """
-    Analyserer siden og fangede API-svar for at afgøre,
-    om 6 passagerbilletter er tilgængelige.
-
-    Returnerer True (ledigt) / False (udsolgt) / None (ukendt).
+    Analyserer siden og fangede API-svar for at afgøre tilgængelighed.
+    Returnerer True / False / None.
     """
-    # ── Tjek API-svar først (mest pålidelig kilde) ────────────────────────
+    # Tjek API-svar først
     for item in captured:
-        result = parse_api_for_availability(item["url"], item["data"])
+        result = parse_api_for_availability(item["url"], item["data"], watch)
         if result is not None:
-            log.info(f"Tilgængelighed fra API: {result} ({item['url']})")
+            log.info(f"[{watch.id}] Tilgængelighed fra API: {result}")
             return result
 
-    # ── Analyser sidetekst ────────────────────────────────────────────────
     page_text = await page.evaluate("() => document.body.innerText")
     log.info(
-        f"Sidetekst til analyse (første 3000 tegn):\n"
+        f"[{watch.id}] Sidetekst (første 3000 tegn):\n"
         f"{'─'*60}\n{page_text[:3000]}\n{'─'*60}"
     )
 
-    # Søg efter kapacitetstal: "X ledige" eller "Ledige: X"
-    seat_matches = re.findall(r"(\d+)\s*ledige", page_text, re.IGNORECASE)
-    for count_str in seat_matches:
+    # Søg efter kapacitetstal: "X ledige"
+    for count_str in re.findall(r"(\d+)\s*ledige", page_text, re.IGNORECASE):
         count = int(count_str)
-        log.info(f"Fundet antal ledige pladser: {count}")
-        if count >= PASSENGERS:
+        log.info(f"[{watch.id}] Ledige pladser fundet: {count}")
+        if count >= watch.passengers:
             return True
         if count == 0:
             return False
 
-    # Søg efter dansk-sprogede udsolgt/ledig signaler
     text_lower = page_text.lower()
-
-    unavailable_signals = [
-        "udsolgt", "fuld", "ingen ledige pladser",
-        "ikke muligt at bestille", "lukket for booking",
-        "sold out", "fully booked",
+    found_unavail = [
+        s for s in ["udsolgt", "fuld", "ingen ledige", "lukket for booking", "sold out"]
+        if s in text_lower
     ]
-    available_signals = [
-        "ledige pladser", "ledige billetter", "bestil nu",
-        "vælg afgang", "book nu",
+    found_avail = [
+        s for s in ["ledige pladser", "ledige billetter", "bestil nu", "vælg afgang"]
+        if s in text_lower
     ]
+    log.info(f"[{watch.id}] Udsolgt-signaler: {found_unavail}")
+    log.info(f"[{watch.id}] Ledig-signaler:   {found_avail}")
 
-    found_unavail = [s for s in unavailable_signals if s in text_lower]
-    found_avail   = [s for s in available_signals if s in text_lower]
-    log.info(f"Udsolgt-signaler: {found_unavail}")
-    log.info(f"Ledig-signaler:   {found_avail}")
-
-    # ── Analyser specifikke afgangs-elementer ────────────────────────────
-    departure_result = await scan_departure_elements(page)
+    departure_result = await scan_departure_elements(page, watch)
     if departure_result is not None:
         return departure_result
 
-    # ── Heuristik fallback ────────────────────────────────────────────────
     if found_unavail and not found_avail:
         return False
-    if found_avail and not found_unavail:
-        # Forsigtig: bekræft at det vedrører vores rute
-        if FROM_STOP in page_text:
-            return True
+    if found_avail and not found_unavail and watch.from_stop in page_text:
+        return True
 
     log.warning(
-        "Kunne ikke afgøre tilgængelighed entydigt — "
-        "se screenshot og log for manuel kontrol"
+        f"[{watch.id}] Kunne ikke afgøre tilgængelighed — se screenshot"
     )
     return None
 
 
-async def scan_departure_elements(page: Page) -> Optional[bool]:
-    """
-    Scanner afgangs-rækker/-kort på siden og leder efter
-    status-indikatorer for ruten Anholt → Grenå.
-    """
-    selectors = [
-        "[class*='departure']",
-        "[class*='sailing']",
-        "[class*='afgang']",
-        "[class*='trip-row']",
-        "[class*='timetable-row']",
-        "tr",
-        "[role='row']",
-    ]
-
-    for sel in selectors:
+async def scan_departure_elements(page: Page, watch: Watch) -> Optional[bool]:
+    """Scanner afgangsrækker på siden for status-indikatorer."""
+    for sel in [
+        "[class*='departure']", "[class*='sailing']", "[class*='afgang']",
+        "[class*='trip-row']", "[class*='timetable-row']", "tr", "[role='row']",
+    ]:
         try:
             elements = await page.locator(sel).all()
             if not elements:
                 continue
-            log.info(f"Fandt {len(elements)} elementer med '{sel}'")
-            for el in elements[:30]:  # Tjek de første 30
+            for el in elements[:30]:
                 text = (await el.text_content() or "").strip()
                 if not text:
                     continue
-                # Er det relevant for vores rute?
-                if FROM_STOP not in text and TO_STOP not in text:
+                if watch.from_stop not in text and watch.to_stop not in text:
                     continue
-                log.info(f"Afgangs-element: {text[:150]!r}")
+                log.info(f"[{watch.id}] Afgangs-element: {text[:150]!r}")
                 text_lower = text.lower()
-                # Udsolgt-check
-                if any(
-                    p in text_lower
-                    for p in ["udsolgt", "fuld", "ingen", "lukket", "sold out"]
-                ):
-                    log.info("  → IKKE LEDIG")
+                if any(p in text_lower for p in ["udsolgt", "fuld", "ingen", "lukket"]):
                     return False
-                # Ledig-check (med passagertal)
                 seat_match = re.search(r"(\d+)\s*ledige", text_lower)
                 if seat_match:
                     seats = int(seat_match.group(1))
-                    log.info(f"  → {seats} ledige pladser")
-                    return seats >= PASSENGERS
-                if any(
-                    p in text_lower
-                    for p in ["ledig", "available", "vælg", "bestil"]
-                ):
-                    log.info("  → LEDIG (signal)")
+                    log.info(f"[{watch.id}] Pladser: {seats}")
+                    return seats >= watch.passengers
+                if any(p in text_lower for p in ["ledig", "vælg", "bestil"]):
                     return True
         except Exception as exc:
-            log.debug(f"Selector '{sel}' fejlede: {exc}")
-
+            log.debug(f"[{watch.id}] Selector '{sel}' fejlede: {exc}")
     return None
 
 
-def parse_api_for_availability(url: str, data) -> Optional[bool]:
-    """
-    Forsøger at udlæse tilgængelighed fra et teambooking API-svar.
-    Returnerer True/False/None.
-    """
+def parse_api_for_availability(url: str, data, watch: Watch) -> Optional[bool]:
+    """Forsøger at udlæse tilgængelighed fra et teambooking API-svar."""
     if not isinstance(data, (dict, list)):
         return None
 
-    # Rekursiv søgning efter kendte kapacitetsfelter
     def search(obj, depth: int = 0) -> Optional[bool]:
         if depth > 6:
             return None
         if isinstance(obj, dict):
             for key, val in obj.items():
                 key_l = key.lower()
-                # Kapacitets-/tilgængeligheds-nøgler
-                if any(
-                    k in key_l
-                    for k in [
-                        "available", "ledige", "capacity", "seats",
-                        "passengers", "pax", "remaining", "free",
-                    ]
-                ):
+                if any(k in key_l for k in [
+                    "available", "ledige", "capacity", "seats",
+                    "passengers", "pax", "remaining", "free",
+                ]):
                     if isinstance(val, int):
-                        log.info(f"API-felt '{key}' = {val}")
-                        return val >= PASSENGERS
+                        log.info(f"[{watch.id}] API-felt '{key}' = {val}")
+                        return val >= watch.passengers
                     if isinstance(val, bool):
                         return val
-                # Udsolgt-felter
                 if any(k in key_l for k in ["sold_out", "soldout", "full", "udsolgt"]):
                     if isinstance(val, bool):
-                        return not val  # sold_out=True → False (ikke ledigt)
+                        return not val
                 result = search(val, depth + 1)
                 if result is not None:
                     return result
         elif isinstance(obj, list):
-            # Filtrer på dato og rute, hvis muligt
             for item in obj:
                 if isinstance(item, dict):
-                    # Check om dette element vedrører vores dato/rute
                     item_str = json.dumps(item, ensure_ascii=False).lower()
                     date_match = (
-                        TARGET_DATE in item_str
-                        or TARGET_DATE.replace("-", "") in item_str
+                        watch.date in item_str
+                        or watch.date.replace("-", "") in item_str
                     )
-                    route_match = (
-                        FROM_STOP.lower() in item_str
-                        or "anholt" in item_str
-                    )
+                    route_match = watch.from_stop.lower() in item_str
                     if date_match or route_match:
                         result = search(item, depth + 1)
                         if result is not None:
                             return result
-            # Fallback: søg i alle elementer
             for item in obj:
                 result = search(item, depth + 1)
                 if result is not None:
@@ -640,95 +588,116 @@ def parse_api_for_availability(url: str, data) -> Optional[bool]:
     return search(data)
 
 
+# ─── Behandling af én overvågning ─────────────────────────────────────────────
+
+async def process_watch(watch: Watch, state: dict) -> None:
+    """
+    Kører tilgængelighedstjek for én overvågning og opdaterer state/notifikationer.
+    """
+    log.info(f"── Overvågning: {watch.label()} ──")
+    ws = watch_state(state, watch.id)
+
+    # Brug cachet API-endpoint, hvis vi kender det
+    available: Optional[bool] = None
+    discovered_api = state.get("discovered_api")
+
+    if discovered_api:
+        available = try_api_check(discovered_api, watch)
+        if available is None:
+            log.info(f"[{watch.id}] API-tjek mislykkedes — starter Playwright")
+
+    if available is None:
+        try:
+            available, new_api = await asyncio.wait_for(
+                check_watch_with_playwright(watch),
+                timeout=WATCH_TIMEOUT_SECONDS,
+            )
+            if new_api and new_api != discovered_api:
+                log.info(f"[{watch.id}] Ny API-URL opdaget: {new_api}")
+                state["discovered_api"] = new_api
+        except asyncio.TimeoutError:
+            log.error(
+                f"[{watch.id}] Timeout efter {WATCH_TIMEOUT_SECONDS}s"
+            )
+            ws["last_error"] = f"timeout:{datetime.utcnow().isoformat()}Z"
+            return
+
+    ws["last_check"] = datetime.utcnow().isoformat() + "Z"
+
+    if available is None:
+        log.error(f"[{watch.id}] Kunne ikke afgøre tilgængelighed — se screenshot")
+        ws["last_error"] = f"unknown:{datetime.utcnow().isoformat()}Z"
+        return
+
+    log.info(f"[{watch.id}] Resultat: {'LEDIGT ✓' if available else 'IKKE LEDIGT ✗'}")
+
+    prev_available = ws.get("available", False)
+    was_notified   = ws.get("notified", False)
+
+    if available and not was_notified:
+        log.info(f"[{watch.id}] Ny tilgængelighed — sender notifikation!")
+        send_ntfy(watch, available=True)
+        ws["available"] = True
+        ws["notified"]  = True
+
+    elif not available and prev_available:
+        log.info(f"[{watch.id}] Tilgængelighed tabt — nulstiller notifikations-flag")
+        send_ntfy(watch, available=False)
+        ws["available"] = False
+        ws["notified"]  = False
+
+    elif available and was_notified:
+        log.info(f"[{watch.id}] Stadig ledigt — notifikation allerede sendt")
+
+    else:
+        log.info(f"[{watch.id}] Stadig ikke ledigt — ingen handling")
+        ws["available"] = False
+
+    ws["last_error"] = None
+
+
 # ─── Hoved-funktion ───────────────────────────────────────────────────────────
 
 async def main() -> int:
-    """
-    Hovedfunktion. Returnerer exit-kode: 0 = success, 1 = fejl.
-    """
+    """Indlæser alle aktive overvågninger og kører dem én ad gangen."""
     log.info("=" * 60)
     log.info("Anholt Ferry Availability Checker")
-    log.info(f"  Rute:       {FROM_STOP} → {TO_STOP}")
-    log.info(f"  Dato:       {TARGET_DATE}")
-    log.info(f"  Passagerer: {PASSENGERS}")
-    log.info(f"  Tidspunkt:  {datetime.utcnow().isoformat()}Z UTC")
+    log.info(f"Tidspunkt: {datetime.utcnow().isoformat()}Z UTC")
+    log.info(f"Watches:   {WATCHES_FILE}")
     log.info("=" * 60)
 
     if not NTFY_TOPIC:
         log.warning("NTFY_TOPIC er ikke sat — notifikationer deaktiveret")
 
+    watches = load_watches()
+    if not watches:
+        log.warning("Ingen aktive overvågninger fundet i watches.json")
+        return 0
+
     state = load_state()
+    errors = 0
 
-    # Brug cachet API-endpoint fra forrige kørsel, hvis tilgængeligt
-    available: Optional[bool] = None
-    discovered_api: Optional[str] = state.get("discovered_api")
-
-    if discovered_api:
-        log.info(f"Forsøger direkte API-tjek med cachet endpoint: {discovered_api}")
-        available = try_api_check(discovered_api)
-        if available is None:
-            log.info("Direkte API-tjek mislykkedes — falder tilbage til Playwright")
-
-    if available is None:
-        log.info("Starter Playwright-session...")
-        try:
-            available, new_api = await asyncio.wait_for(
-                check_with_playwright(),
-                timeout=OVERALL_TIMEOUT_SECONDS,
-            )
-            if new_api and new_api != discovered_api:
-                log.info(f"Ny API-URL opdaget og gemt: {new_api}")
-                state["discovered_api"] = new_api
-        except asyncio.TimeoutError:
-            log.error(
-                f"Samlet timeout efter {OVERALL_TIMEOUT_SECONDS}s — "
-                "tjek mislykkedes"
-            )
-            state["last_error"] = f"timeout:{datetime.utcnow().isoformat()}Z"
-            save_state(state)
-            return 1
-
-    # ── Evaluer resultatet ────────────────────────────────────────────────────
-    if available is None:
-        log.error(
-            "Kunne ikke afgøre tilgængelighed — "
-            "se screenshots/ mappen for fejlretning"
-        )
-        state["last_error"] = f"unknown:{datetime.utcnow().isoformat()}Z"
+    for i, watch in enumerate(watches):
+        await process_watch(watch, state)
         save_state(state)
-        return 1
 
-    log.info(f"Resultat: {'LEDIGT ✓' if available else 'IKKE LEDIGT ✗'}")
+        # Hensynsfuld pause mellem overvågninger, undtagen efter den sidste
+        if i < len(watches) - 1:
+            log.info(f"Venter {PAUSE_SECONDS}s før næste overvågning...")
+            await asyncio.sleep(PAUSE_SECONDS)
 
-    prev_available = state.get("available", False)
-    was_notified   = state.get("notified", False)
+    # Tæl fejl for exit-kode
+    for watch in watches:
+        ws = state["watches"].get(watch.id, {})
+        if ws.get("last_error"):
+            errors += 1
 
-    if available and not was_notified:
-        # Ny tilgængelighed fundet — send notifikation
-        log.info("Ny tilgængelighed — sender notifikation!")
-        send_ntfy(available=True)
-        state["available"] = True
-        state["notified"]  = True
-
-    elif not available and prev_available:
-        # Tilgængelighed forsvundet — nulstil flag og send besked
-        log.info("Tilgængelighed tabt — nulstiller notifikations-flag")
-        send_ntfy(available=False)
-        state["available"] = False
-        state["notified"]  = False
-
-    elif available and was_notified:
-        # Stadig ledigt, men vi har allerede notificeret — gør ingenting
-        log.info("Stadig ledigt — notifikation allerede sendt, ingen handling")
-
-    else:
-        # Stadig ikke ledigt — ingen handling
-        log.info("Stadig ikke ledigt — ingen handling")
-        state["available"] = False
-
-    state["last_error"] = None
-    save_state(state)
-    return 0
+    log.info("=" * 60)
+    log.info(
+        f"Færdig. {len(watches)} overvågning(er) behandlet, {errors} fejl."
+    )
+    log.info("=" * 60)
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
