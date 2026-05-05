@@ -517,80 +517,211 @@ async def detect_availability(
 
 
 async def scan_departure_elements(page: Page, watch: Watch) -> Optional[bool]:
-    """Scanner afgangsrækker på siden for status-indikatorer."""
-    for sel in [
-        "[class*='departure']", "[class*='sailing']", "[class*='afgang']",
-        "[class*='trip-row']", "[class*='timetable-row']", "tr", "[role='row']",
-    ]:
+    """
+    Scanner afgangsrækker på siden for status-indikatorer.
+
+    Siden viser to bokse side om side: én per ruteretning.
+    Vi finder boksen der matcher watch-retningen, og læser
+    person-antallet ud af "Ledige pladser: [bil] X [person] Y".
+    """
+    # Siden fra screenshot har en boks-struktur per ruteretning.
+    # Vi leder efter en container der indeholder watch.from_stop > watch.to_stop.
+    # Eksempel-tekst i en boks: "Anholt > Grenå\n7:50 - 11:00 ...\nLedige pladser: 0 202"
+    from_stop = watch.from_stop
+    to_stop   = watch.to_stop
+
+    # Prøv at finde ruteoverskrifter som "Anholt > Grenå" eller "Grenå > Anholt"
+    route_selectors = [
+        "[class*='departure']", "[class*='sailing']", "[class*='route']",
+        "[class*='direction']", "[class*='afgang']", "[class*='col']",
+        "div", "section", "article",
+    ]
+
+    for sel in route_selectors:
         try:
             elements = await page.locator(sel).all()
-            if not elements:
-                continue
-            for el in elements[:30]:
+            for el in elements[:50]:
                 text = (await el.text_content() or "").strip()
-                if not text:
+                if not text or len(text) < 5:
                     continue
-                if watch.from_stop not in text and watch.to_stop not in text:
+
+                # Boksen skal indeholde BEGGE stop og de skal stå i rigtig rækkefølge
+                # (from_stop nævnt FØR to_stop i teksten)
+                fi = text.find(from_stop)
+                ti = text.find(to_stop)
+                if fi == -1 or ti == -1 or fi >= ti:
                     continue
-                log.info(f"[{watch.id}] Afgangs-element: {text[:150]!r}")
+
+                log.info(f"[{watch.id}] Rutematch-element ({sel}): {text[:200]!r}")
+
+                # Udsolgt-signaler
                 text_lower = text.lower()
-                if any(p in text_lower for p in ["udsolgt", "fuld", "ingen", "lukket"]):
+                if any(p in text_lower for p in ["udsolgt", "lukket", "ingen afgang"]):
+                    log.info(f"[{watch.id}] → Udsolgt-signal fundet")
                     return False
-                seat_match = re.search(r"(\d+)\s*ledige", text_lower)
-                if seat_match:
-                    seats = int(seat_match.group(1))
-                    log.info(f"[{watch.id}] Pladser: {seats}")
-                    return seats >= watch.passengers
-                if any(p in text_lower for p in ["ledig", "vælg", "bestil"]):
+
+                # Mønster: "Ledige pladser: [bil-ikon] X [person-ikon] Y"
+                # Ikonerne forsvinder ved text_content(); vi får bare tallene.
+                # Vi leder efter to tal efter "ledige pladser" — det sidste er passagerer.
+                ledige_match = re.search(
+                    r"ledige pladser[:\s]*(\d+)\D+(\d+)", text_lower
+                )
+                if ledige_match:
+                    # Første tal = biler, andet tal = personer (jf. screenshot)
+                    persons = int(ledige_match.group(2))
+                    log.info(
+                        f"[{watch.id}] Ledige pladser — "
+                        f"biler: {ledige_match.group(1)}, personer: {persons}"
+                    )
+                    return persons >= watch.passengers
+
+                # Fallback: ét enkelt tal efter "ledige pladser"
+                single_match = re.search(r"ledige pladser[:\s]*(\d+)", text_lower)
+                if single_match:
+                    persons = int(single_match.group(1))
+                    log.info(f"[{watch.id}] Ledige pladser (enkelt tal): {persons}")
+                    return persons >= watch.passengers
+
+                # "Bestil"-knap synlig = pladser tilgængelige
+                if "book" in text_lower or "bestil" in text_lower:
+                    log.info(f"[{watch.id}] BOOK-knap fundet → antager ledigt")
                     return True
+
         except Exception as exc:
             log.debug(f"[{watch.id}] Selector '{sel}' fejlede: {exc}")
+
     return None
 
 
 def parse_api_for_availability(url: str, data, watch: Watch) -> Optional[bool]:
-    """Forsøger at udlæse tilgængelighed fra et teambooking API-svar."""
+    """
+    Finder passagertilgængelighed i teambooking API-svar.
+
+    Regler:
+    1. Filtrer på ruteretning (from/to skal matche watch).
+    2. Prioritér passager-felter (availablePersons o.l.) frem for bil-felter.
+    3. Ignorer bil-felter (availableCars o.l.) fuldstændigt ved passager-check.
+    """
     if not isinstance(data, (dict, list)):
+        return None
+
+    # Nøgleord der peger på bil-felter — ignoreres
+    CAR_WORDS    = {"car", "cars", "bil", "biler", "vehicle", "vehicles", "auto"}
+    # Nøgleord der peger på passager-felter — højeste prioritet
+    PERSON_WORDS = {"person", "persons", "passenger", "passengers", "pax",
+                    "people", "personer", "passager", "passagerer"}
+    # Fra/til-feltnavne
+    FROM_WORDS   = {"from", "fra", "departure", "origin", "afgang", "fromharbour",
+                    "fromport", "fromstop"}
+    TO_WORDS     = {"to", "til", "arrival", "destination", "ankomst", "toharbour",
+                    "toport", "tostop"}
+
+    from_l   = watch.from_stop.lower()
+    to_l     = watch.to_stop.lower()
+    # Håndtér alternativ stavning: Grenå ↔ Grenaa, Ærø ↔ Aeroe etc.
+    from_alt = from_l.replace("å", "aa").replace("ø", "oe").replace("æ", "ae")
+    to_alt   = to_l.replace("å", "aa").replace("ø", "oe").replace("æ", "ae")
+
+    def stop_matches(val: str, stop: str, alt: str) -> bool:
+        v = val.lower()
+        return stop in v or alt in v
+
+    def direction_matches(obj: dict) -> bool:
+        """Returnerer True hvis objekt har fra/til-felter der matcher watch-ruten."""
+        found_from = found_to = False
+        for k, v in obj.items():
+            if not isinstance(v, str):
+                continue
+            k_l = k.lower().replace("_", "").replace("-", "")
+            if any(w in k_l for w in FROM_WORDS):
+                if stop_matches(v, from_l, from_alt):
+                    found_from = True
+            if any(w in k_l for w in TO_WORDS):
+                if stop_matches(v, to_l, to_alt):
+                    found_to = True
+        return found_from and found_to
+
+    def person_count(obj: dict) -> Optional[int]:
+        """
+        Finder antal ledige passagerpladser i et dict.
+        Returnerer None hvis ingen relevant feltværdi findes.
+        Ignorerer altid bil-felter.
+        """
+        best_person: Optional[int] = None
+        best_generic: Optional[int] = None
+
+        for k, v in obj.items():
+            if not isinstance(v, int):
+                continue
+            k_l = k.lower()
+            # Spring bil-felter helt over
+            if any(c in k_l for c in CAR_WORDS):
+                log.debug(f"[{watch.id}] Ignorerer bil-felt '{k}' = {v}")
+                continue
+            # Passager-specifikt felt (bedst)
+            if any(p in k_l for p in PERSON_WORDS):
+                log.info(f"[{watch.id}] API person-felt '{k}' = {v}")
+                best_person = v
+            # Generisk tilgængeligheds-felt (fallback)
+            elif any(a in k_l for a in ("available", "ledige", "remaining", "seats")):
+                log.info(f"[{watch.id}] API generelt felt '{k}' = {v}")
+                best_generic = v
+
+        # Passager-felt vinder over generisk
+        if best_person is not None:
+            return best_person
+        return best_generic
+
+    def search_list(items: list, depth: int) -> Optional[bool]:
+        # Første runde: kun entries med korrekt ruteretning
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if direction_matches(item):
+                count = person_count(item)
+                if count is not None:
+                    log.info(
+                        f"[{watch.id}] Rutematch ({from_l}->{to_l}), "
+                        f"ledige passagerpladser: {count}"
+                    )
+                    return count >= watch.passengers
+                result = search(item, depth + 1)
+                if result is not None:
+                    return result
+
+        # Anden runde: dato-match som fallback (men stadig kun person-felter)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_str = json.dumps(item, ensure_ascii=False).lower()
+            if watch.date in item_str or watch.date.replace("-", "") in item_str:
+                count = person_count(item)
+                if count is not None:
+                    log.info(
+                        f"[{watch.id}] Dato-match fallback ({from_l}->{to_l}), "
+                        f"ledige passagerpladser: {count}"
+                    )
+                    return count >= watch.passengers
+
         return None
 
     def search(obj, depth: int = 0) -> Optional[bool]:
         if depth > 6:
             return None
+        if isinstance(obj, list):
+            return search_list(obj, depth)
         if isinstance(obj, dict):
-            for key, val in obj.items():
-                key_l = key.lower()
-                if any(k in key_l for k in [
-                    "available", "ledige", "capacity", "seats",
-                    "passengers", "pax", "remaining", "free",
-                ]):
-                    if isinstance(val, int):
-                        log.info(f"[{watch.id}] API-felt '{key}' = {val}")
-                        return val >= watch.passengers
-                    if isinstance(val, bool):
-                        return val
-                if any(k in key_l for k in ["sold_out", "soldout", "full", "udsolgt"]):
-                    if isinstance(val, bool):
-                        return not val
-                result = search(val, depth + 1)
-                if result is not None:
-                    return result
-        elif isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, dict):
-                    item_str = json.dumps(item, ensure_ascii=False).lower()
-                    date_match = (
-                        watch.date in item_str
-                        or watch.date.replace("-", "") in item_str
-                    )
-                    route_match = watch.from_stop.lower() in item_str
-                    if date_match or route_match:
-                        result = search(item, depth + 1)
-                        if result is not None:
-                            return result
-            for item in obj:
-                result = search(item, depth + 1)
-                if result is not None:
-                    return result
+            # Er dette dict selv en afgangsbeskrivelse med rutematch?
+            if direction_matches(obj):
+                count = person_count(obj)
+                if count is not None:
+                    return count >= watch.passengers
+            # Rekurser ind i nested strukturer
+            for v in obj.values():
+                if isinstance(v, (dict, list)):
+                    result = search(v, depth + 1)
+                    if result is not None:
+                        return result
         return None
 
     return search(data)
