@@ -113,20 +113,12 @@ def load_watches() -> list[Watch]:
 # ─── State-håndtering ─────────────────────────────────────────────────────────
 
 def load_state() -> dict:
-    """Indlæser gemt tilstand. State er struktureret pr. watch-id."""
-    default = {"watches": {}, "discovered_api": None}
+    """Indlæser gemt tilstand. Gemmer kun discovered_api på tværs af kørsler."""
+    default = {"discovered_api": None}
     if STATE_FILE.exists():
         try:
             state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            # Gammelt enkelt-watch-format mangler 'watches'-nøglen — nulstil.
-            if "watches" not in state:
-                log.warning(
-                    "State-fil er i gammelt format (enkelt-watch) — "
-                    "nulstiller til nyt multi-watch format"
-                )
-                return default
-            log.info(f"Gemt tilstand indlæst fra {STATE_FILE}")
-            return state
+            return {"discovered_api": state.get("discovered_api")}
         except Exception as exc:
             log.warning(f"Kunne ikke læse state-fil, starter frisk: {exc}")
     return default
@@ -141,44 +133,23 @@ def save_state(state: dict) -> None:
     log.info(f"Tilstand gemt → {STATE_FILE}")
 
 
-def watch_state(state: dict, watch_id: str) -> dict:
-    """Henter eller opretter state-entry for en specifik overvågning."""
-    if watch_id not in state["watches"]:
-        state["watches"][watch_id] = {
-            "available": False,
-            "notified": False,
-            "last_check": None,
-            "last_error": None,
-        }
-    return state["watches"][watch_id]
-
-
 # ─── Notifikationer ───────────────────────────────────────────────────────────
 
-def send_ntfy(watch: Watch, available: bool) -> bool:
+def send_ntfy(watch: Watch) -> bool:
     """Sender en push-notifikation via ntfy.sh for én overvågning."""
     if not NTFY_TOPIC:
         log.warning("NTFY_TOPIC er ikke sat — notifikation springes over")
         return False
 
-    if available:
-        title    = f"Ledige billetter: {watch.from_stop} -> {watch.to_stop}!"
-        message  = (
-            f"Der ser ud til at vaere ledige billetter paa Anholtfaergen:\n"
-            f"{watch.passengers} personer, {watch.from_stop} til {watch.to_stop}, "
-            f"{watch.date_danish()}.\n"
-            f"Tjek og book her: {BOOKING_URL}"
-        )
-        priority = 4   # ntfy: 1=min 2=low 3=default 4=high 5=max
-        tags     = ["white_check_mark", "ship"]
-    else:
-        title    = f"Anholtfaergen: Pladser vaek - {watch.from_stop} -> {watch.to_stop}"
-        message  = (
-            f"{watch.passengers} billetter {watch.from_stop} -> {watch.to_stop} "
-            f"den {watch.date_danish()} er ikke laengere ledige."
-        )
-        priority = 2
-        tags     = ["x"]
+    title    = f"Ledige billetter: {watch.from_stop} -> {watch.to_stop}!"
+    message  = (
+        f"Der ser ud til at vaere ledige billetter paa Anholtfaergen:\n"
+        f"{watch.passengers} personer, {watch.from_stop} til {watch.to_stop}, "
+        f"{watch.date_danish()}.\n"
+        f"Tjek og book her: {BOOKING_URL}"
+    )
+    priority = 4   # ntfy: 1=min 2=low 3=default 4=high 5=max
+    tags     = ["white_check_mark", "ship"]
 
     # Bruger ntfy's JSON API — undgaar ASCII-begrænsninger i HTTP-headers.
     url = f"{NTFY_SERVER.rstrip('/')}"
@@ -743,12 +714,11 @@ def parse_api_for_availability(url: str, data, watch: Watch) -> Optional[bool]:
 
 async def process_watch(watch: Watch, state: dict) -> None:
     """
-    Kører tilgængelighedstjek for én overvågning og opdaterer state/notifikationer.
+    Kører tilgængelighedstjek for én overvågning.
+    Sender notifikation ved hver kørsel der finder ledige billetter.
     """
     log.info(f"── Overvågning: {watch.label()} ──")
-    ws = watch_state(state, watch.id)
 
-    # Brug cachet API-endpoint, hvis vi kender det
     available: Optional[bool] = None
     discovered_api = state.get("discovered_api")
 
@@ -767,44 +737,20 @@ async def process_watch(watch: Watch, state: dict) -> None:
                 log.info(f"[{watch.id}] Ny API-URL opdaget: {new_api}")
                 state["discovered_api"] = new_api
         except asyncio.TimeoutError:
-            log.error(
-                f"[{watch.id}] Timeout efter {WATCH_TIMEOUT_SECONDS}s"
-            )
-            ws["last_error"] = f"timeout:{datetime.utcnow().isoformat()}Z"
+            log.error(f"[{watch.id}] Timeout efter {WATCH_TIMEOUT_SECONDS}s")
             return
-
-    ws["last_check"] = datetime.utcnow().isoformat() + "Z"
 
     if available is None:
         log.error(f"[{watch.id}] Kunne ikke afgøre tilgængelighed — se screenshot")
-        ws["last_error"] = f"unknown:{datetime.utcnow().isoformat()}Z"
         return
 
     log.info(f"[{watch.id}] Resultat: {'LEDIGT ✓' if available else 'IKKE LEDIGT ✗'}")
 
-    prev_available = ws.get("available", False)
-    was_notified   = ws.get("notified", False)
-
-    if available and not was_notified:
-        log.info(f"[{watch.id}] Ny tilgængelighed — sender notifikation!")
-        sent = send_ntfy(watch, available=True)
-        ws["available"] = True
-        ws["notified"]  = sent  # Kun True hvis ntfy faktisk bekræftede levering
-
-    elif not available and prev_available:
-        log.info(f"[{watch.id}] Tilgængelighed tabt — nulstiller notifikations-flag")
-        send_ntfy(watch, available=False)
-        ws["available"] = False
-        ws["notified"]  = False
-
-    elif available and was_notified:
-        log.info(f"[{watch.id}] Stadig ledigt — notifikation allerede sendt")
-
+    if available:
+        log.info(f"[{watch.id}] Ledige billetter — sender notifikation!")
+        send_ntfy(watch)
     else:
-        log.info(f"[{watch.id}] Stadig ikke ledigt — ingen handling")
-        ws["available"] = False
-
-    ws["last_error"] = None
+        log.info(f"[{watch.id}] Ikke ledigt — ingen handling")
 
 
 # ─── Hoved-funktion ───────────────────────────────────────────────────────────
@@ -826,7 +772,6 @@ async def main() -> int:
         return 0
 
     state = load_state()
-    errors = 0
 
     for i, watch in enumerate(watches):
         await process_watch(watch, state)
@@ -837,18 +782,10 @@ async def main() -> int:
             log.info(f"Venter {PAUSE_SECONDS}s før næste overvågning...")
             await asyncio.sleep(PAUSE_SECONDS)
 
-    # Tæl fejl for exit-kode
-    for watch in watches:
-        ws = state["watches"].get(watch.id, {})
-        if ws.get("last_error"):
-            errors += 1
-
     log.info("=" * 60)
-    log.info(
-        f"Færdig. {len(watches)} overvågning(er) behandlet, {errors} fejl."
-    )
+    log.info(f"Færdig. {len(watches)} overvågning(er) behandlet.")
     log.info("=" * 60)
-    return 1 if errors else 0
+    return 0
 
 
 if __name__ == "__main__":
