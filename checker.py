@@ -163,10 +163,9 @@ def send_ntfy(watch: Watch) -> bool:
     }
     try:
         resp = httpx.post(url, json=payload, timeout=15)
+        log.info(f"[{watch.id}] ntfy svar {resp.status_code}: {resp.text}")
         if not resp.is_success:
-            log.error(
-                f"[{watch.id}] ntfy svarede {resp.status_code}: {resp.text}"
-            )
+            log.error(f"[{watch.id}] ntfy fejlede — notifikation ikke sendt")
             return False
         log.info(f"[{watch.id}] Notifikation sendt [priority={priority}]: {title}")
         return True
