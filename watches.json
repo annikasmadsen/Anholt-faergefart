@@ -7,12 +7,3 @@
     "passengers": 1,
     "enabled": true
   },
-  {
-    "id": "grenaa-anholt-15maj",
-    "from": "Grenå",
-    "to": "Anholt",
-    "date": "2026-05-15",
-    "passengers": 1,
-    "enabled": true
-  }
-]
