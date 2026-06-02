@@ -21,8 +21,29 @@ env:
   PYTHONIOENCODING: "utf-8"
 
 jobs:
+  # ── Guard: spring alt over hvis watches.json er tom ──────────────────────
+  guard:
+    name: Tjek om overvågning er aktiv
+    runs-on: ubuntu-22.04
+    outputs:
+      active: ${{ steps.check.outputs.active }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Læs watches.json
+        id: check
+        run: |
+          count=$(python3 -c "
+          import json, pathlib
+          raw = pathlib.Path('watches.json').read_text().strip()
+          data = json.loads(raw) if raw else []
+          print(len(data))
+          " 2>/dev/null || echo 0)
+          echo "active=$([ "$count" -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
+
   check:
     name: Tjek tilgængelighed
+    needs: guard
+    if: needs.guard.outputs.active == 'true'
     # ubuntu-22.04 (Jammy) bruges fremfor ubuntu-latest (24.04),
     # fordi libasound2 — en Playwright-systempakke — er fjernet i Ubuntu 24.
     runs-on: ubuntu-22.04
