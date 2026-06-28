@@ -16,14 +16,5 @@
     "passengers": 1,
     "ntfy_topic": "anholt-faerge-julie",
     "enabled": true
-  },
-  {  
-    "id": "Anholt-Grenaa-5juli",
-    "from": "Anholt",
-    "to": "Grenå",
-    "date": "2026-07-05",
-    "passengers": 1,
-    "ntfy_topic": "anholt-annika-7x3k",
-    "enabled": true
   }
 ]
