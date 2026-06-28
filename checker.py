@@ -7,11 +7,12 @@ for alle aktive afgange. Sender push-notifikation via ntfy.sh,
 når ledige pladser opdages for en overvågning.
 
 Konfiguration via environment variables:
-  NTFY_TOPIC     – ntfy-topic (kræves for notifikationer)
   NTFY_SERVER    – ntfy-serveradresse (default: https://ntfy.sh)
   WATCHES_FILE   – sti til watches.json (default: watches.json)
   STATE_FILE     – sti til state-fil (default: availability_state.json)
   PAUSE_SECONDS  – pause i sekunder mellem overvågninger (default: 5)
+
+ntfy-emne konfigureres per overvågning i watches.json via feltet "ntfy_topic".
 """
 
 import argparse
@@ -41,7 +42,6 @@ from playwright.async_api import (
 )
 
 # ─── Konfiguration ────────────────────────────────────────────────────────────
-NTFY_TOPIC      = os.getenv("NTFY_TOPIC", "")
 NTFY_SERVER     = os.getenv("NTFY_SERVER", "https://ntfy.sh")
 WATCHES_FILE    = Path(os.getenv("WATCHES_FILE", "watches.json"))
 STATE_FILE      = Path(os.getenv("STATE_FILE", "availability_state.json"))
@@ -72,6 +72,7 @@ class Watch:
     to_stop: str
     date: str
     passengers: int
+    ntfy_topic: str
     enabled: bool
 
     def label(self) -> str:
@@ -94,17 +95,21 @@ def load_watches() -> list[Watch]:
         log.error(f"Kan ikke finde {WATCHES_FILE} — opret filen med dine overvågninger")
         sys.exit(1)
     raw = json.loads(WATCHES_FILE.read_text(encoding="utf-8"))
-    watches = [
-        Watch(
+    watches = []
+    for w in raw:
+        ntfy_topic = w.get("ntfy_topic", "").strip()
+        if not ntfy_topic:
+            log.error(f"Overvågning '{w.get('id', '?')}' mangler 'ntfy_topic' — springes over")
+            continue
+        watches.append(Watch(
             id=w["id"],
             from_stop=w["from"],
             to_stop=w["to"],
             date=w["date"],
             passengers=w["passengers"],
+            ntfy_topic=ntfy_topic,
             enabled=w.get("enabled", True),
-        )
-        for w in raw
-    ]
+        ))
     active = [w for w in watches if w.enabled]
     log.info(f"Indlæst {len(watches)} overvågning(er), {len(active)} aktiv(e)")
     return active
@@ -137,10 +142,6 @@ def save_state(state: dict) -> None:
 
 def send_ntfy(watch: Watch) -> bool:
     """Sender en push-notifikation via ntfy.sh for én overvågning."""
-    if not NTFY_TOPIC:
-        log.warning("NTFY_TOPIC er ikke sat — notifikation springes over")
-        return False
-
     title    = f"Ledige billetter: {watch.from_stop} -> {watch.to_stop}!"
     message  = (
         f"Der ser ud til at vaere ledige billetter paa Anholtfaergen:\n"
@@ -154,7 +155,7 @@ def send_ntfy(watch: Watch) -> bool:
     # Bruger ntfy's JSON API — undgaar ASCII-begrænsninger i HTTP-headers.
     url = f"{NTFY_SERVER.rstrip('/')}"
     payload = {
-        "topic":    NTFY_TOPIC,
+        "topic":    watch.ntfy_topic,
         "title":    title,
         "message":  message,
         "priority": priority,
@@ -761,9 +762,6 @@ async def main() -> int:
     log.info(f"Tidspunkt: {datetime.utcnow().isoformat()}Z UTC")
     log.info(f"Watches:   {WATCHES_FILE}")
     log.info("=" * 60)
-
-    if not NTFY_TOPIC:
-        log.warning("NTFY_TOPIC er ikke sat — notifikationer deaktiveret")
 
     watches = load_watches()
     if not watches:

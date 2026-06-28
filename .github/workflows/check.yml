@@ -88,7 +88,6 @@ jobs:
       # Ruter og datoer konfigureres i watches.json — ikke her.
       - name: Kør checker
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           # NTFY_SERVER kan overskrives som repository-variabel; default: ntfy.sh
           NTFY_SERVER: ${{ vars.NTFY_SERVER || 'https://ntfy.sh' }}
         run: |

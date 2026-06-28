@@ -34,6 +34,7 @@ Alle afgange du ønsker overvåget styres fra filen `watches.json` i dit reposit
     "to": "Grenå",
     "date": "2026-05-17",
     "passengers": 6,
+    "ntfy_topic": "anholt-annika-2026-xyz",
     "enabled": true
   },
   {
@@ -42,6 +43,7 @@ Alle afgange du ønsker overvåget styres fra filen `watches.json` i dit reposit
     "to": "Anholt",
     "date": "2026-05-20",
     "passengers": 4,
+    "ntfy_topic": "anholt-mor-2026-abc",
     "enabled": false
   }
 ]
@@ -56,6 +58,7 @@ Alle afgange du ønsker overvåget styres fra filen `watches.json` i dit reposit
 | `to` | `"Grenå"` | Ankomststed. |
 | `date` | `"2026-05-17"` | Dato i format YYYY-MM-DD. |
 | `passengers` | `6` | Antal passagerer der skal være plads til. |
+| `ntfy_topic` | `"anholt-annika-2026-xyz"` | ntfy-emnenavnet som notifikationen sendes til. Hvert familiemedlem bruger sit eget emne. |
 | `enabled` | `true` | `true` = overvåg aktivt. `false` = spring over. |
 
 ---
@@ -79,6 +82,7 @@ Alle afgange du ønsker overvåget styres fra filen `watches.json` i dit reposit
     "to": "Grenå",
     "date": "2026-05-17",
     "passengers": 6,
+    "ntfy_topic": "anholt-annika-2026-xyz",
     "enabled": true
   },
   {
@@ -87,6 +91,7 @@ Alle afgange du ønsker overvåget styres fra filen `watches.json` i dit reposit
     "to": "Grenå",
     "date": "2026-05-24",
     "passengers": 6,
+    "ntfy_topic": "anholt-mor-2026-abc",
     "enabled": true
   }
 ]
@@ -129,18 +134,11 @@ ntfy er en gratis notifikationstjeneste. Du behøver ikke oprette en konto.
 
 ---
 
-### Trin 2 – Tilføj emnenavnet som GitHub Secret
+### Trin 2 – Tilføj emnenavnet i watches.json
 
-En GitHub Secret er en krypteret variabel, som kun botten kan læse.
+Emnenavnet fra Trin 1 skrives direkte ind i `watches.json` som `ntfy_topic` på hver afgang du vil overvåge. Se eksemplet ovenfor under "Sådan ser filen ud".
 
-1. Gå til dit GitHub-repository.
-2. Klik på **Settings** (øverst, ved siden af Insights).
-3. Klik i venstremenuen på **Secrets and variables** → **Actions**.
-4. Klik på **New repository secret**.
-5. Udfyld:
-   - **Name:** `NTFY_TOPIC`
-   - **Secret:** dit emnenavn fra Trin 1
-6. Klik **Add secret**.
+Hvert familiemedlem bruger sit eget emnenavn — du angiver blot det rigtige emne på den afgang, der tilhører dem.
 
 ---
 
@@ -180,7 +178,6 @@ Ny tilgængelighed — sender notifikation!
 ```cmd
 pip install -r requirements.txt
 playwright install chromium
-set NTFY_TOPIC=dit-emnenavn-her
 python checker.py
 ```
 
@@ -188,7 +185,6 @@ python checker.py
 ```bash
 pip install -r requirements.txt
 playwright install chromium
-export NTFY_TOPIC=dit-emnenavn-her
 python checker.py
 ```
 
@@ -199,7 +195,7 @@ Screenshots gemmes i `screenshots/` — åbn dem for at se, hvad botten så.
 ## Fejlretning
 
 ### Botten sender ingen notifikationer
-- Tjek at `NTFY_TOPIC` er sat under GitHub Secrets.
+- Tjek at `ntfy_topic` er udfyldt korrekt på den relevante afgang i `watches.json`.
 - Kør workflowet manuelt med **"Vis udvidet debug-log"** aktiveret.
 - Tjek screenshot-artifacts i den pågældende kørsel (klik på kørslen → Artifacts).
 
@@ -239,8 +235,9 @@ Screenshots gemmes i `screenshots/` — åbn dem for at se, hvad botten så.
 
 | Variabel | Standard | Beskrivelse |
 |---|---|---|
-| `NTFY_TOPIC` | *(kræves)* | Dit ntfy-emnenavn |
 | `NTFY_SERVER` | `https://ntfy.sh` | ntfy-serveradresse |
 | `WATCHES_FILE` | `watches.json` | Sti til overvågningslisten |
 | `STATE_FILE` | `availability_state.json` | Sti til state-fil |
 | `PAUSE_SECONDS` | `5` | Pause i sekunder mellem overvågninger |
+
+ntfy-emnet konfigureres per afgang i `watches.json` via feltet `ntfy_topic`.
