@@ -1,20 +1,12 @@
 [
   {  
-    "id": "grenaa-anholt-6juli",
+    "id": "grenaa-anholt-11juli-formiddag",
     "from": "Grenå",
     "to": "Anholt",
     "date": "2026-07-06",
+    "time": "11:30",
     "passengers": 1,
-    "ntfy_topic": "anholt-faerge-julie",
-    "enabled": true
-  },
-  {  
-    "id": "grenaa-anholt-5juli",
-    "from": "Grenå",
-    "to": "Anholt",
-    "date": "2026-07-05",
-    "passengers": 1,
-    "ntfy_topic": "anholt-faerge-julie",
+    "ntfy_topic": "anholt-annika-7x3k",
     "enabled": true
   }
 ]

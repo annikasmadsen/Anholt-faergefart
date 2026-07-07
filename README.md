@@ -57,6 +57,7 @@ Alle afgange du ønsker overvåget styres fra filen `watches.json` i dit reposit
 | `from` | `"Anholt"` | Afgangssted. |
 | `to` | `"Grenå"` | Ankomststed. |
 | `date` | `"2026-05-17"` | Dato i format YYYY-MM-DD. |
+| `time` | `"07:50"` | **Valgfrit.** Afgangstidspunkt (HH:MM). Brug det, når der er **flere afgange samme dag** på samme rute, så botten kun kigger på den rigtige afgang. Udelades feltet, tjekker botten alle afgange på dagen (som hidtil). |
 | `passengers` | `6` | Antal passagerer der skal være plads til. |
 | `ntfy_topic` | `"anholt-annika-2026-xyz"` | ntfy-emnenavnet som notifikationen sendes til. Hvert familiemedlem bruger sit eget emne. |
 | `enabled` | `true` | `true` = overvåg aktivt. `false` = spring over. |
@@ -110,6 +111,27 @@ Alle afgange du ønsker overvåget styres fra filen `watches.json` i dit reposit
 Ret blot felterne `"passengers"` eller `"date"` direkte i `watches.json` og gem filen. Botten bruger de nye værdier ved næste kørsel.
 
 > **OBS:** Hvis du ændrer `"date"` eller `"passengers"` på en overvågning, beholder botten sit gamle notifikations-flag. Ønsker du at "nulstille" en overvågning (f.eks. for at modtage ny besked), så skift `"id"` til et nyt unikt navn.
+
+---
+
+### To afgange samme dag – vælg tidspunkt
+
+Er der to afgange samme dag på samme rute, tilføjer du feltet `"time"` med afgangstidspunktet (HH:MM), så botten kun kigger på netop den afgang:
+
+```json
+{
+  "id": "grenaa-anholt-6juli-formiddag",
+  "from": "Grenå",
+  "to": "Anholt",
+  "date": "2026-07-06",
+  "time": "07:50",
+  "passengers": 1,
+  "ntfy_topic": "anholt-faerge-julie",
+  "enabled": true
+}
+```
+
+Vil du overvåge **begge** afgange, opretter du to overvågninger med hver sit `"id"` og `"time"` (f.eks. `"07:50"` og `"14:00"`). Udelader du `"time"`, tjekker botten alle afgange på dagen som hidtil.
 
 ---
 

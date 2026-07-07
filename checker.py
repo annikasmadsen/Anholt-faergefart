@@ -63,6 +63,55 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+# ─── Klokkeslæt-hjælpere ──────────────────────────────────────────────────────
+#
+# Afgangstid er valgfri per overvågning. Bruges til at skelne mellem to afgange
+# samme dag/retning. Formatet på bookingsiden er "H:MM" (fx "7:50"); API'et kan
+# bruge "07:50" eller et ISO-timestamp (fx "...T07:50:00"). Vi normaliserer alt
+# til (time, minut) og matcher på det, så formatvariationer ikke betyder noget.
+
+def parse_time(value: str) -> Optional[tuple[int, int]]:
+    """Fortolker '7:50', '07:50', '7.50' → (7, 50). Returnerer None ved ugyldigt."""
+    if not value:
+        return None
+    m = re.match(r"^\s*(\d{1,2})[:.](\d{2})\s*$", value)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if 0 <= h <= 23 and 0 <= mi <= 59:
+        return (h, mi)
+    return None
+
+
+# Klokkeslæt i tekst/API bruger kolon (fx "7:50" eller "...T07:50:00").
+# Lookarounds sikrer at vi ikke plukker cifre ud af længere tal, og at et tal
+# efter 'T' i et ISO-timestamp stadig fanges (\b ville fejle mellem T og cifret).
+_TIME_RE = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)")
+
+
+def time_tokens(text: str) -> set[tuple[int, int]]:
+    """Udtrækker alle gyldige klokkeslæt-tokens fra en tekst som (time, minut)."""
+    tokens: set[tuple[int, int]] = set()
+    for m in _TIME_RE.finditer(text):
+        h, mi = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            tokens.add((h, mi))
+    return tokens
+
+
+def _slice_from_time(text: str, target: tuple[int, int]) -> str:
+    """
+    Returnerer teksten fra første forekomst af det ønskede klokkeslæt og frem.
+    Bruges til at knytte 'Ledige pladser'-tal til den rigtige afgang, når flere
+    afgange står i samme tekstboks. Falder tilbage til hele teksten hvis tiden
+    ikke findes.
+    """
+    for m in _TIME_RE.finditer(text):
+        if (int(m.group(1)), int(m.group(2))) == target:
+            return text[m.start():]
+    return text
+
+
 # ─── Watch-dataklasse ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -74,10 +123,23 @@ class Watch:
     passengers: int
     ntfy_topic: str
     enabled: bool
+    # Valgfri afgangstid, normaliseret til (time, minut). None = match alle
+    # afgange på dagen (uændret adfærd fra før tidsfilteret fandtes).
+    watch_time: Optional[tuple[int, int]] = None
+
+    def time_str(self) -> str:
+        """Klokkeslæt som 'HH:MM', eller tom streng hvis ikke sat."""
+        if self.watch_time is None:
+            return ""
+        return f"{self.watch_time[0]:02d}:{self.watch_time[1]:02d}"
 
     def label(self) -> str:
         """Kort beskrivelse til log og notifikation."""
-        return f"{self.from_stop}→{self.to_stop} {self.date} ({self.passengers} pers.)"
+        tid = f" kl. {self.time_str()}" if self.watch_time else ""
+        return (
+            f"{self.from_stop}→{self.to_stop} {self.date}{tid} "
+            f"({self.passengers} pers.)"
+        )
 
     def date_danish(self) -> str:
         """Dato formateret på dansk: '17. maj 2026'."""
@@ -101,6 +163,17 @@ def load_watches() -> list[Watch]:
         if not ntfy_topic:
             log.error(f"Overvågning '{w.get('id', '?')}' mangler 'ntfy_topic' — springes over")
             continue
+
+        # Valgfri afgangstid. Ugyldigt format → advarsel, og vi matcher alle
+        # afgange på dagen (fremfor stiltiende at droppe overvågningen).
+        raw_time = str(w.get("time", "")).strip()
+        watch_time = parse_time(raw_time) if raw_time else None
+        if raw_time and watch_time is None:
+            log.warning(
+                f"Overvågning '{w.get('id', '?')}' har ugyldigt 'time'-format "
+                f"'{raw_time}' (forventet fx '07:50') — ignorerer tidsfilter"
+            )
+
         watches.append(Watch(
             id=w["id"],
             from_stop=w["from"],
@@ -109,6 +182,7 @@ def load_watches() -> list[Watch]:
             passengers=w["passengers"],
             ntfy_topic=ntfy_topic,
             enabled=w.get("enabled", True),
+            watch_time=watch_time,
         ))
     active = [w for w in watches if w.enabled]
     log.info(f"Indlæst {len(watches)} overvågning(er), {len(active)} aktiv(e)")
@@ -142,11 +216,13 @@ def save_state(state: dict) -> None:
 
 def send_ntfy(watch: Watch) -> bool:
     """Sender en push-notifikation via ntfy.sh for én overvågning."""
-    title    = f"Ledige billetter: {watch.from_stop} -> {watch.to_stop}!"
+    tid_titel = f" kl. {watch.time_str()}" if watch.watch_time else ""
+    tid_tekst = f" kl. {watch.time_str()}" if watch.watch_time else ""
+    title    = f"Ledige billetter: {watch.from_stop} -> {watch.to_stop}{tid_titel}!"
     message  = (
         f"Der ser ud til at vaere ledige billetter paa Anholtfaergen:\n"
         f"{watch.passengers} personer, {watch.from_stop} til {watch.to_stop}, "
-        f"{watch.date_danish()}.\n"
+        f"{watch.date_danish()}{tid_tekst}.\n"
         f"Tjek og book her: {BOOKING_URL}"
     )
     priority = 4   # ntfy: 1=min 2=low 3=default 4=high 5=max
@@ -535,19 +611,34 @@ async def scan_departure_elements(page: Page, watch: Watch) -> Optional[bool]:
                 if fi == -1 or ti == -1 or fi >= ti:
                     continue
 
+                # Hvis en afgangstid er angivet: boksen skal nævne netop den tid.
+                # Ellers springer vi denne boks over (kan være den anden afgang
+                # samme dag/retning).
+                if watch.watch_time is not None:
+                    if watch.watch_time not in time_tokens(text):
+                        continue
+                    log.info(
+                        f"[{watch.id}] Tidsmatch kl. {watch.time_str()} i boks"
+                    )
+
                 log.info(f"[{watch.id}] Rutematch-element ({sel}): {text[:200]!r}")
 
-                # Udsolgt-signaler
-                text_lower = text.lower()
-                if any(p in text_lower for p in ["udsolgt", "lukket", "ingen afgang"]):
-                    log.info(f"[{watch.id}] → Udsolgt-signal fundet")
-                    return False
+                # Når en tid er sat, kan boksen indeholde FLERE afgange (fx
+                # 7:50 og 14:00 i samme kolonne). Vi begrænser aflæsningen til
+                # teksten FRA den valgte afgangstid og fremefter, så vi læser den
+                # rigtige afgangs pladser. Uden tid bruges hele boksen som før.
+                scan_text = text.lower()
+                if watch.watch_time is not None:
+                    scan_text = _slice_from_time(text, watch.watch_time).lower()
 
                 # Mønster: "Ledige pladser: [bil-ikon] X [person-ikon] Y"
                 # Ikonerne forsvinder ved text_content(); vi får bare tallene.
-                # Vi leder efter to tal efter "ledige pladser" — det sidste er passagerer.
+                # Vi leder efter to tal efter "ledige pladser" — det sidste er
+                # passagerer. Dette er det stærkeste signal (og første forekomst
+                # efter afgangstiden hører til den valgte afgang), så vi tjekker
+                # det FØR den generiske udsolgt-tekst.
                 ledige_match = re.search(
-                    r"ledige pladser[:\s]*(\d+)\D+(\d+)", text_lower
+                    r"ledige pladser[:\s]*(\d+)\D+(\d+)", scan_text
                 )
                 if ledige_match:
                     # Første tal = biler, andet tal = personer (jf. screenshot)
@@ -559,14 +650,20 @@ async def scan_departure_elements(page: Page, watch: Watch) -> Optional[bool]:
                     return persons >= watch.passengers
 
                 # Fallback: ét enkelt tal efter "ledige pladser"
-                single_match = re.search(r"ledige pladser[:\s]*(\d+)", text_lower)
+                single_match = re.search(r"ledige pladser[:\s]*(\d+)", scan_text)
                 if single_match:
                     persons = int(single_match.group(1))
                     log.info(f"[{watch.id}] Ledige pladser (enkelt tal): {persons}")
                     return persons >= watch.passengers
 
+                # Udsolgt-signaler (svagere tekstbaseret fallback, når intet tal
+                # blev fundet). Begrænset til den valgte afgangs tekstvindue.
+                if any(p in scan_text for p in ["udsolgt", "lukket", "ingen afgang"]):
+                    log.info(f"[{watch.id}] → Udsolgt-signal fundet")
+                    return False
+
                 # "Bestil"-knap synlig = pladser tilgængelige
-                if "book" in text_lower or "bestil" in text_lower:
+                if "book" in scan_text or "bestil" in scan_text:
                     log.info(f"[{watch.id}] BOOK-knap fundet → antager ledigt")
                     return True
 
@@ -608,6 +705,17 @@ def parse_api_for_availability(url: str, data, watch: Watch) -> Optional[bool]:
     def stop_matches(val: str, stop: str, alt: str) -> bool:
         v = val.lower()
         return stop in v or alt in v
+
+    def time_matches(item) -> bool:
+        """
+        True hvis afgangen matcher watch-tidspunktet — eller hvis intet
+        tidspunkt er sat (så matcher alle afgange, som før tidsfilteret fandtes).
+        Søger i hele objektets JSON, så både '07:50' og ISO-timestamps fanges.
+        """
+        if watch.watch_time is None:
+            return True
+        item_str = json.dumps(item, ensure_ascii=False)
+        return watch.watch_time in time_tokens(item_str)
 
     def direction_matches(obj: dict) -> bool:
         """Returnerer True hvis objekt har fra/til-felter der matcher watch-ruten."""
@@ -656,15 +764,16 @@ def parse_api_for_availability(url: str, data, watch: Watch) -> Optional[bool]:
         return best_generic
 
     def search_list(items: list, depth: int) -> Optional[bool]:
-        # Første runde: kun entries med korrekt ruteretning
+        # Første runde: kun entries med korrekt ruteretning OG tidspunkt
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if direction_matches(item):
+            if direction_matches(item) and time_matches(item):
                 count = person_count(item)
                 if count is not None:
                     log.info(
-                        f"[{watch.id}] Rutematch ({from_l}->{to_l}), "
+                        f"[{watch.id}] Rutematch ({from_l}->{to_l})"
+                        f"{f' kl. {watch.time_str()}' if watch.watch_time else ''}, "
                         f"ledige passagerpladser: {count}"
                     )
                     return count >= watch.passengers
@@ -672,16 +781,19 @@ def parse_api_for_availability(url: str, data, watch: Watch) -> Optional[bool]:
                 if result is not None:
                     return result
 
-        # Anden runde: dato-match som fallback (men stadig kun person-felter)
+        # Anden runde: dato-match som fallback (men stadig kun person-felter,
+        # og stadig med tidspunkt-filter hvis sat)
         for item in items:
             if not isinstance(item, dict):
                 continue
             item_str = json.dumps(item, ensure_ascii=False).lower()
-            if watch.date in item_str or watch.date.replace("-", "") in item_str:
+            if (watch.date in item_str or watch.date.replace("-", "") in item_str) \
+                    and time_matches(item):
                 count = person_count(item)
                 if count is not None:
                     log.info(
-                        f"[{watch.id}] Dato-match fallback ({from_l}->{to_l}), "
+                        f"[{watch.id}] Dato-match fallback ({from_l}->{to_l})"
+                        f"{f' kl. {watch.time_str()}' if watch.watch_time else ''}, "
                         f"ledige passagerpladser: {count}"
                     )
                     return count >= watch.passengers
@@ -694,8 +806,8 @@ def parse_api_for_availability(url: str, data, watch: Watch) -> Optional[bool]:
         if isinstance(obj, list):
             return search_list(obj, depth)
         if isinstance(obj, dict):
-            # Er dette dict selv en afgangsbeskrivelse med rutematch?
-            if direction_matches(obj):
+            # Er dette dict selv en afgangsbeskrivelse med rutematch + tidsmatch?
+            if direction_matches(obj) and time_matches(obj):
                 count = person_count(obj)
                 if count is not None:
                     return count >= watch.passengers
