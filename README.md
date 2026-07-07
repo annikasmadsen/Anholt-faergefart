@@ -192,6 +192,8 @@ Resultat: LEDIGT ✓
 Ny tilgængelighed — sender notifikation!
 ```
 
+> **Tip:** Har overvågningen et `time`-felt, vises klokkeslættet også i loggen — fx `── Overvågning: Grenå→Anholt 2026-07-06 kl. 07:50 (1 pers.) ──`. Efter en kørsel med `time` er det værd at tjekke, at linjen `Rutematch (... kl. 07:50), ledige passagerpladser: X` viser den rigtige afgangs pladser.
+
 ---
 
 ## Lokal test (valgfrit)
