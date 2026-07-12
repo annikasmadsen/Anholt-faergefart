@@ -7,6 +7,6 @@
     "time": "11:30",
     "passengers": 1,
     "ntfy_topic": "anholt-annika-7x3k",
-    "enabled": true
+    "enabled": false
   }
 ]
